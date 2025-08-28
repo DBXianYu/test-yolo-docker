@@ -1,0 +1,12 @@
+# 注意：torch和torchvision在Dockerfile中单独安装CUDA版本
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+python-multipart>=0.0.6
+Pillow>=9.0.0
+opencv-python>=4.7.0
+numpy>=1.21.0
+# torch>=2.0.0  # 由Dockerfile处理CUDA版本
+# torchvision>=0.15.0  # 由Dockerfile处理CUDA版本
+ultralytics>=8.0.0
+prometheus-client>=0.16.0
+requests>=2.28.0
