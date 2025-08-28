@@ -171,6 +171,12 @@ def onnx_inference(input_data: np.ndarray, confidence_threshold: float = 0.25, o
             # 推理
             outputs = session.run(None, {input_name: input_data})
             
+            # 调试输出格式
+            logger.info(f"ONNX输出形状: {[output.shape for output in outputs]}")
+            logger.info(f"ONNX输出数量: {len(outputs)}")
+            if len(outputs) > 0:
+                logger.info(f"第一个输出的前几个值: {outputs[0].flatten()[:10]}")
+            
             # 后处理，传入原始图像尺寸
             return postprocess_yolo_output(outputs[0], confidence_threshold, original_size)
         
@@ -268,6 +274,8 @@ def postprocess_yolo_output(output: np.ndarray, conf_threshold: float = 0.25, or
         conf_threshold: 置信度阈值
         original_size: 原始图像尺寸 (width, height)
     """
+    logger.info(f"后处理输入: 输出形状={output.shape}, 置信度阈值={conf_threshold}, 原始尺寸={original_size}")
+    
     detections = []
     
     # 默认模型输入尺寸
@@ -277,21 +285,36 @@ def postprocess_yolo_output(output: np.ndarray, conf_threshold: float = 0.25, or
     if original_size:
         scale_x = original_size[0] / model_size[0]  # width缩放比例
         scale_y = original_size[1] / model_size[1]  # height缩放比例
+        logger.info(f"缩放比例: scale_x={scale_x:.3f}, scale_y={scale_y:.3f}")
     else:
         scale_x = scale_y = 1.0
     
     # YOLO输出格式处理
     if len(output.shape) == 3:  # [1, num_boxes, 85]
         output = output[0]  # 去掉batch维度
+        logger.info(f"移除batch维度后: {output.shape}")
+    
+    # 检查是否需要转置 (YOLOv8 ONNX输出可能是转置的)
+    if output.shape[0] < output.shape[1]:  # (14, 8400) -> (8400, 14)
+        output = output.T
+        logger.info(f"转置后: {output.shape}")
+    
+    # 检查前几个检测的原始数据
+    for i in range(min(3, len(output))):
+        det = output[i]
+        if len(det) >= 5:
+            logger.info(f"检测{i}: 前8个值={det[:8]}")
     
     # 遍历每个检测框
-    for detection in output:
+    for i, detection in enumerate(output):
         if len(detection) >= 5:
             confidence = detection[4]
             
             if confidence > conf_threshold:
                 # 获取边界框坐标 (基于640x640)
                 x_center, y_center, width, height = detection[:4]
+                
+                logger.info(f"原始坐标: center=({x_center:.2f},{y_center:.2f}), size=({width:.2f},{height:.2f})")
                 
                 # 转换为 (x1, y1, x2, y2) 格式 (基于640x640)
                 x1 = x_center - width / 2
@@ -305,6 +328,8 @@ def postprocess_yolo_output(output: np.ndarray, conf_threshold: float = 0.25, or
                 x2_scaled = min(original_size[0] if original_size else 640, x2 * scale_x)
                 y2_scaled = min(original_size[1] if original_size else 640, y2 * scale_y)
                 
+                logger.info(f"缩放后坐标: ({x1_scaled:.2f},{y1_scaled:.2f}) -> ({x2_scaled:.2f},{y2_scaled:.2f})")
+                
                 # 获取类别（如果有多类别）
                 class_id = 0
                 if len(detection) > 5:
@@ -317,7 +342,12 @@ def postprocess_yolo_output(output: np.ndarray, conf_threshold: float = 0.25, or
                     "class_id": int(class_id),
                     "class_name": "defect"
                 })
+                
+                # 只显示前3个检测的详细信息
+                if len(detections) <= 3:
+                    logger.info(f"检测{len(detections)}: bbox=[{x1_scaled:.1f},{y1_scaled:.1f},{x2_scaled:.1f},{y2_scaled:.1f}], conf={confidence:.3f}")
     
+    logger.info(f"后处理完成: 总共{len(detections)}个检测")
     return detections
 
 def tensorrt_inference(input_data: np.ndarray, confidence_threshold: float = 0.25, original_size: tuple = None):
