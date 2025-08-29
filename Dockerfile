@@ -22,7 +22,9 @@ RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple \
     uvicorn==0.24.0 \
     python-multipart==0.0.6 \
     Pillow==10.1.0 \
-    numpy==1.24.3
+    numpy==1.24.3 \
+    opencv-python-headless==4.8.1.78 \
+    cv2
 
 # 清理
 RUN find /opt/venv -name "*.pyc" -delete && \

@@ -7,6 +7,7 @@ import time
 import io
 import os
 import numpy as np
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,35 +15,17 @@ import uvicorn
 from PIL import Image
 import logging
 
+# 尝试导入OpenCV，用于图像处理和NMS
+try:
+    import cv2
+    HAS_OPENCV = True
+except ImportError:
+    HAS_OPENCV = False
+    logging.warning("OpenCV未安装，将使用简化的图像处理")
+
 # 配置日志
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-app = FastAPI(
-    title="Industrial Defect Detection API (Lite)",
-    description="TensorRT Engine based metal surface scratch detection service",
-    version="2.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
-    openapi_url="/openapi.json",
-    # 修复 Swagger UI 静态资源问题
-    swagger_ui_parameters={
-        "displayRequestDuration": True,
-        "filter": True,
-        "showExtensions": True,
-        "showCommonExtensions": True,
-        "deepLinking": True
-    }
-)
-
-# CORS中间件
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 # 全局变量
 engine = None
@@ -50,10 +33,10 @@ context = None
 input_shape = (1, 3, 640, 640)
 output_shapes = [(1, 25200, 85)]  # YOLOv8n输出形状
 
-# 启动时初始化模型
-@app.on_event("startup")
-async def startup_event():
-    """应用启动时初始化模型"""
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """应用生命周期管理"""
+    # 启动时初始化
     logger.info("=== 应用启动，初始化推理引擎 ===")
     
     # 1. 尝试TensorRT
@@ -94,6 +77,38 @@ async def startup_event():
         logger.warning("❌ PyTorch未安装")
     
     logger.info("=== 推理引擎初始化完成 ===")
+    
+    yield  # 应用运行期间
+    
+    # 关闭时清理（如果需要）
+    logger.info("=== 应用关闭，清理资源 ===")
+
+app = FastAPI(
+    title="Industrial Defect Detection API (Lite)",
+    description="TensorRT Engine based metal surface scratch detection service",
+    version="2.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json",
+    lifespan=lifespan,  # 使用新的lifespan处理器
+    # 修复 Swagger UI 静态资源问题
+    swagger_ui_parameters={
+        "displayRequestDuration": True,
+        "filter": True,
+        "showExtensions": True,
+        "showCommonExtensions": True,
+        "deepLinking": True
+    }
+)
+
+# CORS中间件
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 def load_tensorrt_engine(engine_path: str = "defect_yolov8n.engine"):
     """加载TensorRT引擎"""
@@ -129,28 +144,90 @@ def load_tensorrt_engine(engine_path: str = "defect_yolov8n.engine"):
         logger.error(f"TensorRT引擎加载失败: {e}")
         return False
 
-def preprocess_image(image: Image.Image) -> np.ndarray:
-    """图像预处理"""
-    # 调整大小到640x640
-    image = image.convert('RGB')
-    image = image.resize((640, 640))
+def preprocess_image(image: Image.Image, model_height: int = 640, model_width: int = 640):
+    """
+    图像预处理 - 参考YOLO11官方实现
     
-    # 转换为numpy数组
-    img_array = np.array(image, dtype=np.float32)
+    Args:
+        image: PIL图像
+        model_height: 模型输入高度
+        model_width: 模型输入宽度
+        
+    Returns:
+        tuple: (处理后的图像, 缩放比例, padding信息)
+    """
+    # 转换为numpy格式
+    img = np.array(image.convert('RGB'))
     
-    # 归一化 [0, 255] -> [0, 1]
-    img_array = img_array / 255.0
+    # 调整输入图像大小并使用 letterbox 填充
+    shape = img.shape[:2]  # 原始图像大小 (height, width)
+    new_shape = (model_height, model_width)
+    r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
+    ratio = (r, r)
+    new_unpad = int(round(shape[1] * r)), int(round(shape[0] * r))  # (width, height)
+    pad_w, pad_h = (new_shape[1] - new_unpad[0]) / 2, (new_shape[0] - new_unpad[1]) / 2  # 填充宽高
     
-    # HWC -> CHW
-    img_array = img_array.transpose(2, 0, 1)
+    if shape[::-1] != new_unpad:  # 调整图像大小
+        # 使用PIL进行resize
+        resized_image = image.resize(new_unpad, Image.Resampling.BILINEAR)
+        img = np.array(resized_image)
     
-    # 添加batch维度
-    img_array = np.expand_dims(img_array, axis=0)
+    # 计算填充 - 确保padding值是非负整数
+    top = max(0, int(round(pad_h - 0.1)))
+    bottom = max(0, int(round(pad_h + 0.1)))
+    left = max(0, int(round(pad_w - 0.1)))
+    right = max(0, int(round(pad_w + 0.1)))
     
-    return img_array
+    # 验证最终尺寸
+    final_height = img.shape[0] + top + bottom
+    final_width = img.shape[1] + left + right
+    
+    # 如果最终尺寸不等于目标尺寸，调整padding
+    if final_height != model_height:
+        height_diff = model_height - img.shape[0]
+        top = height_diff // 2
+        bottom = height_diff - top
+    
+    if final_width != model_width:
+        width_diff = model_width - img.shape[1]
+        left = width_diff // 2
+        right = width_diff - left
+    
+    # 确保所有padding值都是非负的
+    top, bottom, left, right = max(0, top), max(0, bottom), max(0, left), max(0, right)
+    
+    # 使用numpy进行padding
+    try:
+        # 确保图像是3通道的
+        if len(img.shape) == 2:
+            img = np.stack([img] * 3, axis=-1)
+        elif len(img.shape) == 3 and img.shape[2] == 1:
+            img = np.repeat(img, 3, axis=2)
+        elif len(img.shape) == 3 and img.shape[2] == 4:
+            img = img[:, :, :3]  # 移除alpha通道
+            
+        img = np.pad(img, ((top, bottom), (left, right), (0, 0)), mode='constant', constant_values=114)
+    except ValueError as e:
+        logger.error(f"Padding错误: {e}, img.shape={img.shape}, padding=({top},{bottom},{left},{right})")
+        # 如果padding失败，直接resize到目标尺寸
+        img = np.array(image.resize((model_width, model_height), Image.Resampling.BILINEAR))
+        # 确保是3通道
+        if len(img.shape) == 2:
+            img = np.stack([img] * 3, axis=-1)
+        elif len(img.shape) == 3 and img.shape[2] == 1:
+            img = np.repeat(img, 3, axis=2)
+        elif len(img.shape) == 3 and img.shape[2] == 4:
+            img = img[:, :, :3]
+        pad_w = pad_h = 0
+    
+    # 转换：HWC -> CHW -> RGB -> 除以 255 -> contiguous -> 添加维度
+    img = np.ascontiguousarray(img.transpose(2, 0, 1), dtype=np.float32) / 255.0
+    img_process = img[None] if len(img.shape) == 3 else img
+    
+    return img_process, ratio, (pad_w, pad_h)
 
 def onnx_inference(input_data: np.ndarray, confidence_threshold: float = 0.25, original_size: tuple = None):
-    """ONNX模型推理（更可靠的CPU推理）"""
+    """ONNX模型推理（基于YOLO11官方实现）"""
     try:
         import onnxruntime as ort
         
@@ -177,8 +254,8 @@ def onnx_inference(input_data: np.ndarray, confidence_threshold: float = 0.25, o
             if len(outputs) > 0:
                 logger.info(f"第一个输出的前几个值: {outputs[0].flatten()[:10]}")
             
-            # 后处理，传入原始图像尺寸
-            return postprocess_yolo_output(outputs[0], confidence_threshold, original_size)
+            # 根据博客的方法进行后处理
+            return postprocess_yolo11_output(outputs, original_size, confidence_threshold)
         
     except ImportError:
         logger.warning("ONNX Runtime未安装，尝试PyTorch模型")
@@ -214,7 +291,7 @@ def pytorch_inference(input_data: np.ndarray, confidence_threshold: float = 0.25
                 outputs = model(input_tensor)
             
             # 后处理，传入原始图像尺寸
-            return postprocess_yolo_output(outputs.numpy(), confidence_threshold, original_size)
+            return postprocess_yolo11_output([outputs.numpy()], original_size, confidence_threshold)
             
     except ImportError:
         logger.warning("PyTorch未安装，使用智能模拟")
@@ -266,86 +343,144 @@ def smart_inference_simulation(input_data: np.ndarray, confidence_threshold: flo
     logger.info(f"智能模拟生成 {len(detections)} 个检测结果")
     return detections
 
-def postprocess_yolo_output(output: np.ndarray, conf_threshold: float = 0.25, original_size: tuple = None):
-    """YOLO输出后处理
+def postprocess_yolo11_output(outputs, original_size, confidence_threshold=0.5, iou_threshold=0.45):
+    """
+    YOLO11后处理函数 - 基于博客实现
     
     Args:
-        output: YOLO模型输出
-        conf_threshold: 置信度阈值
+        outputs: ONNX模型输出
         original_size: 原始图像尺寸 (width, height)
+        confidence_threshold: 置信度阈值
+        iou_threshold: IoU阈值
+    
+    Returns:
+        list: 检测结果列表
     """
-    logger.info(f"后处理输入: 输出形状={output.shape}, 置信度阈值={conf_threshold}, 原始尺寸={original_size}")
+    logger.info(f"后处理输入: 输出形状={outputs[0].shape}, 置信度阈值={confidence_threshold}, 原始尺寸={original_size}")
     
-    detections = []
+    # 获取预测输出
+    x = outputs[0]  # Shape: (1, 14, 8400) or similar
     
-    # 默认模型输入尺寸
-    model_size = (640, 640)
+    # 移除batch维度
+    if len(x.shape) == 3:
+        x = x[0]  # Shape: (14, 8400)
+        logger.info(f"移除batch维度后: {x.shape}")
     
-    # 如果提供了原始尺寸，计算缩放比例
-    if original_size:
-        scale_x = original_size[0] / model_size[0]  # width缩放比例
-        scale_y = original_size[1] / model_size[1]  # height缩放比例
-        logger.info(f"缩放比例: scale_x={scale_x:.3f}, scale_y={scale_y:.3f}")
-    else:
-        scale_x = scale_y = 1.0
+    # 转换维度: bcn -> bnc (参考博客中的做法)
+    if x.shape[0] < x.shape[1]:  # (14, 8400) -> (8400, 14)
+        x = x.T
+        logger.info(f"转置后: {x.shape}")
     
-    # YOLO输出格式处理
-    if len(output.shape) == 3:  # [1, num_boxes, 85]
-        output = output[0]  # 去掉batch维度
-        logger.info(f"移除batch维度后: {output.shape}")
+    # 调试前几个检测
+    for i in range(min(3, len(x))):
+        logger.info(f"检测{i}: 前8个值={x[i][:8]}")
     
-    # 检查是否需要转置 (YOLOv8 ONNX输出可能是转置的)
-    if output.shape[0] < output.shape[1]:  # (14, 8400) -> (8400, 14)
-        output = output.T
-        logger.info(f"转置后: {output.shape}")
-    
-    # 检查前几个检测的原始数据
-    for i in range(min(3, len(output))):
-        det = output[i]
-        if len(det) >= 5:
-            logger.info(f"检测{i}: 前8个值={det[:8]}")
-    
-    # 遍历每个检测框
-    for i, detection in enumerate(output):
-        if len(detection) >= 5:
-            confidence = detection[4]
+    # 置信度过滤 - 根据博客方法
+    if x.shape[1] >= 5:
+        # 获取类别置信度的最大值 (第5列开始是类别置信度)
+        class_confidences = x[:, 4:]
+        max_confidences = np.amax(class_confidences, axis=1)
+        
+        # 置信度过滤
+        valid_indices = max_confidences > confidence_threshold
+        filtered_x = x[valid_indices]
+        
+        logger.info(f"置信度过滤: {len(x)} -> {len(filtered_x)}")
+        
+        if len(filtered_x) == 0:
+            logger.info("后处理完成: 总共0个检测")
+            return []
+        
+        # 合并边界框、置信度、类别
+        boxes = filtered_x[:, :4]  # x_center, y_center, width, height
+        confidences = np.amax(filtered_x[:, 4:], axis=1)
+        class_ids = np.argmax(filtered_x[:, 4:], axis=1)
+        
+        # 组合所有信息
+        combined = np.column_stack([boxes, confidences, class_ids])
+        
+        logger.info(f"NMS前检测数: {len(combined)}")
+        
+        # 应用NMS
+        if len(combined) > 0:
+            # 将中心点格式转换为左上角格式用于NMS
+            nms_boxes = combined[:, :4].copy()
+            nms_boxes[:, 0] = nms_boxes[:, 0] - nms_boxes[:, 2] / 2  # x1 = cx - w/2
+            nms_boxes[:, 1] = nms_boxes[:, 1] - nms_boxes[:, 3] / 2  # y1 = cy - h/2
             
-            if confidence > conf_threshold:
-                # 获取边界框坐标 (基于640x640)
-                x_center, y_center, width, height = detection[:4]
+            # 如果有OpenCV，使用OpenCV的NMS
+            if HAS_OPENCV:
+                try:
+                    import cv2
+                    indices = cv2.dnn.NMSBoxes(
+                        nms_boxes.tolist(), 
+                        combined[:, 4].tolist(), 
+                        confidence_threshold, 
+                        iou_threshold
+                    )
+                    
+                    if len(indices) > 0:
+                        if isinstance(indices, np.ndarray):
+                            indices = indices.flatten()
+                        combined = combined[indices]
+                        logger.info(f"OpenCV NMS后检测数: {len(combined)}")
+                except Exception as e:
+                    logger.warning(f"OpenCV NMS失败: {e}")
+            else:
+                # 简单的置信度排序作为NMS替代
+                sorted_indices = np.argsort(combined[:, 4])[::-1]
+                combined = combined[sorted_indices[:10]]  # 取前10个最高置信度的检测
+                logger.info(f"简化NMS后检测数: {len(combined)}")
+        
+        # 计算缩放和padding参数
+        if original_size:
+            original_width, original_height = original_size
+            r = min(640 / original_width, 640 / original_height)
+            new_unpad = int(round(original_width * r)), int(round(original_height * r))
+            pad_w = (640 - new_unpad[0]) / 2
+            pad_h = (640 - new_unpad[1]) / 2
+            logger.info(f"逆变换参数: r={r:.3f}, new_unpad={new_unpad}, pad=({pad_w:.1f},{pad_h:.1f})")
+        else:
+            r = 1.0
+            pad_w = pad_h = 0
+            original_width = original_height = 640
+        
+        detections = []
+        for i, (x_center, y_center, width, height, confidence, class_id) in enumerate(combined):
+            # 坐标转换：从中心点格式转换为角点格式
+            x1 = x_center - width / 2
+            y1 = y_center - height / 2
+            x2 = x_center + width / 2
+            y2 = y_center + height / 2
+            
+            # 去除letterbox填充并缩放到原始图像尺寸
+            if original_size:
+                # 减去padding
+                x1 = (x1 - pad_w) / r
+                y1 = (y1 - pad_h) / r
+                x2 = (x2 - pad_w) / r
+                y2 = (y2 - pad_h) / r
                 
-                logger.info(f"原始坐标: center=({x_center:.2f},{y_center:.2f}), size=({width:.2f},{height:.2f})")
-                
-                # 转换为 (x1, y1, x2, y2) 格式 (基于640x640)
-                x1 = x_center - width / 2
-                y1 = y_center - height / 2
-                x2 = x_center + width / 2
-                y2 = y_center + height / 2
-                
-                # 缩放到原始图像尺寸
-                x1_scaled = max(0, x1 * scale_x)
-                y1_scaled = max(0, y1 * scale_y)
-                x2_scaled = min(original_size[0] if original_size else 640, x2 * scale_x)
-                y2_scaled = min(original_size[1] if original_size else 640, y2 * scale_y)
-                
-                logger.info(f"缩放后坐标: ({x1_scaled:.2f},{y1_scaled:.2f}) -> ({x2_scaled:.2f},{y2_scaled:.2f})")
-                
-                # 获取类别（如果有多类别）
-                class_id = 0
-                if len(detection) > 5:
-                    class_scores = detection[5:]
-                    class_id = np.argmax(class_scores)
-                
-                detections.append({
-                    "bbox": [float(x1_scaled), float(y1_scaled), float(x2_scaled), float(y2_scaled)],
-                    "confidence": float(confidence),
-                    "class_id": int(class_id),
-                    "class_name": "defect"
-                })
-                
-                # 只显示前3个检测的详细信息
-                if len(detections) <= 3:
-                    logger.info(f"检测{len(detections)}: bbox=[{x1_scaled:.1f},{y1_scaled:.1f},{x2_scaled:.1f},{y2_scaled:.1f}], conf={confidence:.3f}")
+                # 限制在图像边界内
+                x1 = max(0, min(x1, original_width))
+                y1 = max(0, min(y1, original_height))
+                x2 = max(0, min(x2, original_width))
+                y2 = max(0, min(y2, original_height))
+            
+            # 跳过无效的边界框
+            if x2 <= x1 or y2 <= y1:
+                continue
+            
+            detections.append({
+                "bbox": [float(x1), float(y1), float(x2), float(y2)],
+                "confidence": float(confidence),
+                "class_id": int(class_id),
+                "class_name": "defect"
+            })
+            
+            # 调试前几个检测
+            if len(detections) <= 3:
+                logger.info(f"检测{len(detections)}: bbox=[{x1:.1f},{y1:.1f},{x2:.1f},{y2:.1f}], conf={confidence:.3f}")
     
     logger.info(f"后处理完成: 总共{len(detections)}个检测")
     return detections
@@ -375,7 +510,7 @@ def tensorrt_inference(input_data: np.ndarray, confidence_threshold: float = 0.2
         output = np.empty(output_shapes[0], dtype=np.float32)
         cuda.memcpy_dtoh(output, h_output)
         
-        return postprocess_yolo_output(output, confidence_threshold, original_size)
+        return postprocess_yolo11_output([output], original_size, confidence_threshold)
         
     except Exception as e:
         logger.error(f"TensorRT推理失败: {e}")
@@ -785,7 +920,7 @@ async def upload_page():
 
                     if (result.status === 'success') {
                         displayResults(result);
-                        drawDetections(result.detections);
+                        drawDetections(result.detections, result.image_info);
                     } else {
                         alert('检测失败: ' + result.detail);
                     }
@@ -844,7 +979,7 @@ async def upload_page():
                 document.getElementById('resultsInfo').style.display = 'block';
             }
 
-            function drawDetections(detections) {
+            function drawDetections(detections, imageInfo) {
                 const canvas = document.getElementById('detectionCanvas');
                 const ctx = canvas.getContext('2d');
                 const img = document.getElementById('previewImage');
@@ -854,18 +989,32 @@ async def upload_page():
 
                 if (!detections || detections.length === 0) return;
 
-                // 计算缩放比例
-                const scaleX = img.offsetWidth / 640;  // 模型输入尺寸
-                const scaleY = img.offsetHeight / 640;
+                // 获取原始图像尺寸和显示尺寸
+                let originalWidth, originalHeight;
+                if (imageInfo && imageInfo.original_size) {
+                    [originalWidth, originalHeight] = imageInfo.original_size;
+                } else {
+                    // 如果没有图像信息，假设检测框已经是相对于显示图像的
+                    originalWidth = img.offsetWidth;
+                    originalHeight = img.offsetHeight;
+                }
+
+                // 计算从原始图像到显示图像的缩放比例
+                const scaleX = img.offsetWidth / originalWidth;
+                const scaleY = img.offsetHeight / originalHeight;
+
+                console.log(`绘制检测框: 原始尺寸=${originalWidth}x${originalHeight}, 显示尺寸=${img.offsetWidth}x${img.offsetHeight}, 缩放=${scaleX.toFixed(3)}x${scaleY.toFixed(3)}`);
 
                 detections.forEach((detection, index) => {
                     const [x1, y1, x2, y2] = detection.bbox;
                     
-                    // 转换坐标到显示尺寸
+                    // 从原始图像坐标转换到显示坐标
                     const drawX = x1 * scaleX;
                     const drawY = y1 * scaleY;
                     const drawWidth = (x2 - x1) * scaleX;
                     const drawHeight = (y2 - y1) * scaleY;
+
+                    console.log(`检测框${index + 1}: 原始=[${x1.toFixed(1)},${y1.toFixed(1)},${x2.toFixed(1)},${y2.toFixed(1)}], 显示=[${drawX.toFixed(1)},${drawY.toFixed(1)},${drawWidth.toFixed(1)},${drawHeight.toFixed(1)}]`);
 
                     // 绘制检测框
                     ctx.strokeStyle = '#ff4444';
@@ -963,11 +1112,6 @@ async def docs_alternative():
     </body>
     </html>
     """
-
-# 启动时加载模型
-@app.on_event("startup")
-async def startup_event():
-    load_tensorrt_engine()
 
 @app.get("/", response_class=HTMLResponse)
 async def root():
@@ -1080,7 +1224,8 @@ async def predict_defects(
                 detail=f"Invalid image file: {str(e)}"
             )
         
-        input_data = preprocess_image(image)
+        # 使用新的预处理方法
+        input_data, ratio, padding = preprocess_image(image, 640, 640)
         
         # 推理 (传递置信度阈值和原始图像尺寸)
         detections = tensorrt_inference(input_data, confidence_threshold, original_size)
@@ -1130,10 +1275,10 @@ async def test_predict():
         test_image_pil = Image.fromarray(test_image)
         
         # 预处理
-        input_data = preprocess_image(test_image_pil)
+        input_data, ratio, padding = preprocess_image(test_image_pil, 640, 640)
         
         # 推理
-        detections = tensorrt_inference(input_data, 0.5)
+        detections = tensorrt_inference(input_data, 0.5, (640, 640))
         
         processing_time = (time.time() - start_time) * 1000
         
