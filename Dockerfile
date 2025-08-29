@@ -1,5 +1,5 @@
 # ============== 终极精简版本 - 无PyTorch ==============
-FROM nvidia/cuda:13.0.0-base-ubuntu22.04 as builder
+FROM nvidia/cuda:13.0.0-base-ubuntu22.04 AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive PIP_NO_CACHE_DIR=1
 
@@ -15,16 +15,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN python3.10 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-# 最小依赖包 - 使用支持IR v9的ONNX Runtime版本
+# 最小依赖包 - 使用最新ONNX Runtime版本
 RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple \
-    onnxruntime==1.16.3 \
+    onnxruntime \
     fastapi==0.104.1 \
     uvicorn==0.24.0 \
     python-multipart==0.0.6 \
     Pillow==10.1.0 \
     numpy==1.24.3 \
-    opencv-python-headless==4.8.1.78 \
-    cv2
+    opencv-python-headless==4.8.1.78
 
 # 清理
 RUN find /opt/venv -name "*.pyc" -delete && \

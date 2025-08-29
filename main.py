@@ -33,6 +33,20 @@ context = None
 input_shape = (1, 3, 640, 640)
 output_shapes = [(1, 25200, 85)]  # YOLOv8n输出形状
 
+# 缺陷类型映射 - 根据实际训练数据
+DEFECT_CLASSES = {
+    0: "换卷冲孔",      # punching_hole
+    1: "换卷焊缝",      # welding_line  
+    2: "换卷月牙弯",    # crescent_gap
+    3: "斑迹-水斑",     # water_spot
+    4: "斑迹-油斑",     # oil_spot
+    5: "斑迹-丝斑",     # silk_spot
+    6: "异物压入",      # inclusion
+    7: "压痕",          # rolled_pit
+    8: "严重折痕",      # crease
+    9: "腰折"           # waist_folding
+}
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
@@ -333,11 +347,15 @@ def smart_inference_simulation(input_data: np.ndarray, confidence_threshold: flo
         base_conf = min(0.95, max(0.1, base_conf))
         
         if base_conf >= confidence_threshold:
+            # 根据实际缺陷类型随机生成（优先生成常见的缺陷类型）
+            # 权重基于数据集中的数量分布
+            defect_weights = [0.8, 1.2, 0.6, 0.8, 1.3, 2.0, 0.8, 0.2, 0.2, 0.3]  # 对应0-9类别的权重
+            class_id = int(np.random.choice(range(10), p=np.array(defect_weights)/sum(defect_weights)))
             detections.append({
                 "bbox": [float(x-w/2), float(y-h/2), float(x+w/2), float(y+h/2)],
                 "confidence": float(base_conf),
-                "class_id": 0,
-                "class_name": "defect"
+                "class_id": class_id,
+                "class_name": DEFECT_CLASSES.get(class_id, f"未知缺陷{class_id}")
             })
     
     logger.info(f"智能模拟生成 {len(detections)} 个检测结果")
@@ -475,7 +493,7 @@ def postprocess_yolo11_output(outputs, original_size, confidence_threshold=0.5, 
                 "bbox": [float(x1), float(y1), float(x2), float(y2)],
                 "confidence": float(confidence),
                 "class_id": int(class_id),
-                "class_name": "defect"
+                "class_name": DEFECT_CLASSES.get(int(class_id), f"缺陷类型{int(class_id)}")
             })
             
             # 调试前几个检测
@@ -788,6 +806,10 @@ async def upload_page():
                         <button class="upload-btn" onclick="document.getElementById('fileInput').click()">
                             📁 选择文件
                         </button>
+                        
+                        <button class="upload-btn" onclick="testJavaScript()" style="background: #4CAF50;">
+                            🧪 测试JS
+                        </button>
                     </div>
                     
                     <div class="stats" id="statsSection" style="display: none;">
@@ -835,65 +857,173 @@ async def upload_page():
             let selectedFile = null;
             let currentImage = null;
 
+            // 全局颜色配置 - 根据实际缺陷类型
+            const DEFECT_COLORS = {
+                '换卷冲孔': '#ff4444',    // 红色 - 结构性缺陷
+                '换卷焊缝': '#ff8800',    // 橙色 - 焊接缺陷
+                '换卷月牙弯': '#8844ff',  // 紫色 - 形变缺陷
+                '斑迹-水斑': '#44aaff',   // 蓝色 - 水渍
+                '斑迹-油斑': '#ffaa00',   // 黄色 - 油渍
+                '斑迹-丝斑': '#888888',   // 灰色 - 丝状痕迹
+                '异物压入': '#ff44aa',    // 粉色 - 异物
+                '压痕': '#44ff44',        // 绿色 - 压痕
+                '严重折痕': '#aa44ff',    // 紫红色 - 严重折痕
+                '腰折': '#ff6666'         // 浅红色 - 腰折
+            };
+
+            // 在页面加载时就显示测试信息
+            window.onload = function() {
+                console.log('页面加载完成');
+                console.log('fileInput元素:', document.getElementById('fileInput'));
+                console.log('upload-area元素:', document.querySelector('.upload-area'));
+                console.log('predictBtn元素:', document.getElementById('predictBtn'));
+            };
+
+            // 测试函数
+            function testJavaScript() {
+                console.log('JavaScript测试函数被调用');
+                alert('JavaScript工作正常！Console中查看详细日志');
+                console.log('fileInput:', document.getElementById('fileInput'));
+                console.log('uploadArea:', document.querySelector('.upload-area'));
+                console.log('imageContainer:', document.getElementById('imageContainer'));
+            }
+
             // 文件选择事件
-            document.getElementById('fileInput').addEventListener('change', function(e) {
-                handleFileSelect(e.target.files[0]);
-            });
+            document.addEventListener('DOMContentLoaded', function() {
+                console.log('DOM加载完成');
+                
+                const fileInput = document.getElementById('fileInput');
+                const uploadArea = document.querySelector('.upload-area');
+                
+                if (fileInput) {
+                    console.log('绑定文件选择事件');
+                    fileInput.addEventListener('change', function(e) {
+                        console.log('文件选择事件触发，文件数量:', e.target.files.length);
+                        if (e.target.files.length > 0) {
+                            console.log('选择的文件:', e.target.files[0]);
+                            handleFileSelect(e.target.files[0]);
+                        }
+                    });
+                } else {
+                    console.error('fileInput 元素未找到');
+                }
 
-            // 拖拽上传
-            const uploadArea = document.querySelector('.upload-area');
-            uploadArea.addEventListener('dragover', (e) => {
-                e.preventDefault();
-                uploadArea.classList.add('dragover');
-            });
+                // 拖拽上传事件
+                if (uploadArea) {
+                    console.log('绑定拖拽事件');
+                    uploadArea.addEventListener('dragover', (e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        console.log('dragover事件');
+                        uploadArea.classList.add('dragover');
+                    });
 
-            uploadArea.addEventListener('dragleave', () => {
-                uploadArea.classList.remove('dragover');
-            });
+                    uploadArea.addEventListener('dragleave', (e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        console.log('dragleave事件');
+                        uploadArea.classList.remove('dragover');
+                    });
 
-            uploadArea.addEventListener('drop', (e) => {
-                e.preventDefault();
-                uploadArea.classList.remove('dragover');
-                handleFileSelect(e.dataTransfer.files[0]);
-            });
+                    uploadArea.addEventListener('drop', (e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        console.log('drop事件，文件数量:', e.dataTransfer.files.length);
+                        uploadArea.classList.remove('dragover');
+                        if (e.dataTransfer.files.length > 0) {
+                            console.log('拖拽的文件:', e.dataTransfer.files[0]);
+                            handleFileSelect(e.dataTransfer.files[0]);
+                        }
+                    });
+                } else {
+                    console.error('uploadArea 元素未找到');
+                }
 
-            // 置信度滑块
-            document.getElementById('confidenceSlider').addEventListener('input', function(e) {
-                document.getElementById('confidenceValue').textContent = e.target.value;
+                // 置信度滑块
+                const slider = document.getElementById('confidenceSlider');
+                if (slider) {
+                    slider.addEventListener('input', function(e) {
+                        document.getElementById('confidenceValue').textContent = e.target.value;
+                    });
+                }
             });
 
             function handleFileSelect(file) {
-                if (!file || !file.type.startsWith('image/')) {
-                    alert('请选择有效的图片文件！');
+                console.log('=== handleFileSelect 开始 ===');
+                console.log('接收到的文件:', file);
+                
+                if (!file) {
+                    console.error('没有文件');
+                    alert('没有选择文件');
+                    return;
+                }
+                
+                console.log('文件名:', file.name);
+                console.log('文件类型:', file.type);
+                console.log('文件大小:', file.size);
+                
+                if (!file.type.startsWith('image/')) {
+                    console.error('文件类型无效:', file.type);
+                    alert('请选择有效的图片文件！文件类型: ' + file.type);
                     return;
                 }
 
+                console.log('文件验证通过，开始处理');
                 selectedFile = file;
-                document.getElementById('predictBtn').disabled = false;
+                
+                // 启用预测按钮
+                const predictBtn = document.getElementById('predictBtn');
+                if (predictBtn) {
+                    predictBtn.disabled = false;
+                    console.log('预测按钮已启用');
+                } else {
+                    console.error('找不到预测按钮');
+                }
 
                 // 显示预览图片
+                console.log('开始读取文件...');
                 const reader = new FileReader();
                 reader.onload = function(e) {
+                    console.log('文件读取成功，数据长度:', e.target.result.length);
                     showPreviewImage(e.target.result);
                 };
+                reader.onerror = function(e) {
+                    console.error('文件读取失败:', e);
+                    alert('文件读取失败，请重试');
+                };
                 reader.readAsDataURL(file);
+                console.log('=== handleFileSelect 结束 ===');
             }
 
             function showPreviewImage(src) {
+                console.log('showPreviewImage 被调用');
                 const container = document.getElementById('imageContainer');
+                
+                if (!container) {
+                    console.error('找不到 imageContainer 元素');
+                    return;
+                }
+                
+                console.log('设置容器内容');
                 container.innerHTML = `
-                    <img id="previewImage" src="${src}" class="preview-image" onload="imageLoaded()">
+                    <img id="previewImage" src="${src}" class="preview-image" onload="imageLoaded()" onerror="imageLoadError()">
                     <canvas id="detectionCanvas" class="detection-overlay"></canvas>
                 `;
             }
 
             function imageLoaded() {
+                console.log('图片加载成功');
                 currentImage = document.getElementById('previewImage');
                 const canvas = document.getElementById('detectionCanvas');
                 canvas.width = currentImage.offsetWidth;
                 canvas.height = currentImage.offsetHeight;
+                console.log('图片尺寸:', currentImage.offsetWidth, 'x', currentImage.offsetHeight);
             }
 
+            function imageLoadError() {
+                console.error('图片加载失败');
+                alert('图片加载失败，请检查文件格式');
+            }
             async function predictDefects() {
                 if (!selectedFile) {
                     alert('请先选择图片！');
@@ -955,7 +1085,7 @@ async def upload_page():
                         item.className = 'result-item';
                         item.innerHTML = `
                             <strong>缺陷 #${index + 1}</strong><br>
-                            类型: ${detection.class_name}<br>
+                            <span style="color: #ff4444; font-weight: bold;">类型: ${detection.class_name}</span><br>
                             置信度: ${Math.round(detection.confidence * 100)}%<br>
                             位置: (${Math.round(detection.bbox[0])}, ${Math.round(detection.bbox[1])}) - 
                                   (${Math.round(detection.bbox[2])}, ${Math.round(detection.bbox[3])})
@@ -1016,23 +1146,41 @@ async def upload_page():
 
                     console.log(`检测框${index + 1}: 原始=[${x1.toFixed(1)},${y1.toFixed(1)},${x2.toFixed(1)},${y2.toFixed(1)}], 显示=[${drawX.toFixed(1)},${drawY.toFixed(1)},${drawWidth.toFixed(1)},${drawHeight.toFixed(1)}]`);
 
+                    // 根据缺陷类型选择颜色
+                    const boxColor = DEFECT_COLORS[detection.class_name] || '#ff4444';
+
                     // 绘制检测框
-                    ctx.strokeStyle = '#ff4444';
+                    ctx.strokeStyle = boxColor;
                     ctx.lineWidth = 3;
                     ctx.strokeRect(drawX, drawY, drawWidth, drawHeight);
 
                     // 绘制半透明填充
-                    ctx.fillStyle = 'rgba(255, 68, 68, 0.2)';
+                    ctx.fillStyle = boxColor.replace('#', 'rgba(') + ', 0.2)'.replace('rgba(rgba(', 'rgba(');
+                    // 处理颜色转换
+                    const r = parseInt(boxColor.substr(1,2), 16);
+                    const g = parseInt(boxColor.substr(3,2), 16);
+                    const b = parseInt(boxColor.substr(5,2), 16);
+                    ctx.fillStyle = `rgba(${r}, ${g}, ${b}, 0.2)`;
                     ctx.fillRect(drawX, drawY, drawWidth, drawHeight);
 
                     // 绘制标签
                     const label = `${detection.class_name} ${Math.round(detection.confidence * 100)}%`;
-                    ctx.fillStyle = '#ff4444';
-                    ctx.fillRect(drawX, drawY - 25, ctx.measureText(label).width + 10, 20);
                     
+                    // 计算标签背景大小
+                    ctx.font = '14px Arial';
+                    const labelWidth = ctx.measureText(label).width + 16;
+                    const labelHeight = 22;
+                    
+                    // 绘制标签背景 - 使用不同颜色表示不同类型
+                    const labelColor = DEFECT_COLORS[detection.class_name] || '#ff4444';
+                    
+                    ctx.fillStyle = labelColor;
+                    ctx.fillRect(drawX, drawY - labelHeight - 2, labelWidth, labelHeight);
+                    
+                    // 绘制标签文字
                     ctx.fillStyle = 'white';
-                    ctx.font = '12px Arial';
-                    ctx.fillText(label, drawX + 5, drawY - 10);
+                    ctx.font = 'bold 14px Arial';
+                    ctx.fillText(label, drawX + 8, drawY - 8);
                 });
             }
         </script>
